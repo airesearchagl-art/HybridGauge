@@ -1,4 +1,5 @@
 mod monitor;
+mod settings;
 use monitor::{FanCommand, Monitor};
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;

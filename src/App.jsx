@@ -46,7 +46,7 @@ function Card({ title, accent, children }) {
 // ── Fan Speed Slider ───────────────────────────────────────────────
 // override: null = auto mode, number = manual speed %
 
-function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActive, override, onOverrideChange }) {
+function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActive, override, onOverrideChange, cooldownSecs }) {
   const isManual = override !== null && override !== undefined;
   const sliderVal = isManual ? override : (currentFanSpeed ?? 50);
 
@@ -88,14 +88,21 @@ function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActiv
         </button>
       </div>
       {isManual && !safetyActive && (
-        <div className="fan-slider-row">
-          <input
-            type="range" min={0} max={100} value={sliderVal}
-            onChange={handleSlider}
-            className="fan-slider"
-          />
-          <span className="fan-slider-val">{sliderVal}%</span>
-        </div>
+        <>
+          <div className="fan-slider-row">
+            <input
+              type="range" min={0} max={100} value={sliderVal}
+              onChange={handleSlider}
+              className="fan-slider"
+            />
+            <span className="fan-slider-val">{sliderVal}%</span>
+          </div>
+          {cooldownSecs != null && (
+            <p className="note cooldown-note">
+              アイドル {cooldownSecs}/30秒 — 30秒後に自動に切り替わります
+            </p>
+          )}
+        </>
       )}
     </div>
   );
@@ -134,6 +141,7 @@ function NvidiaCard({ gpu, fanOverride, onOverrideChange }) {
         safetyActive={gpu.safety_override_active}
         override={fanOverride}
         onOverrideChange={onOverrideChange}
+        cooldownSecs={gpu.cooldown_secs}
       />
     </Card>
   );
@@ -186,8 +194,17 @@ export default function App() {
   useEffect(() => {
     let unlisten;
     listen("metrics-update", (event) => {
-      setMetrics(event.payload);
+      const payload = event.payload;
+      setMetrics(payload);
       setTick((t) => t + 1);
+      // Sync fan overrides from backend (handles cool-down resets & startup restore)
+      setFanOverrides(prev => {
+        const next = { ...prev };
+        payload.nvidia_gpus.forEach(gpu => {
+          next[gpu.index] = gpu.fan_override ?? null;
+        });
+        return next;
+      });
     }).then((fn) => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, []);

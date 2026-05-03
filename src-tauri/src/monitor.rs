@@ -7,6 +7,8 @@ use sysinfo::{Components, CpuRefreshKind, RefreshKind, System};
 #[cfg(windows)]
 use wmi::{COMLibrary, Variant, WMIConnection};
 
+use crate::settings::{self, AppSettings, FanOverrideSetting};
+
 // ──────────────────────────────────────────────
 // Raw NVML fan control (nvml-wrapper exposes read-only fan API;
 // fan speed setting requires nvmlDeviceSetFanSpeed_v2 via libloading)
@@ -70,6 +72,11 @@ pub struct NvidiaGpuMetrics {
     // Fan control metadata
     pub fan_control_available: bool,
     pub safety_override_active: bool,
+    /// Current manual override speed (None = auto mode).
+    pub fan_override: Option<u32>,
+    /// Seconds elapsed at ≤20% load while a manual override is active.
+    /// Reaches 30 → fan resets to auto (cool-down).
+    pub cooldown_secs: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -101,6 +108,8 @@ pub struct Monitor {
     fan_overrides: HashMap<u32, u32>,
     // GPUs currently under safety-100% override
     safety_active: HashSet<u32>,
+    // Cool-down: consecutive seconds each GPU has been at ≤20% load
+    cooldown_ticks: HashMap<u32, u32>,
     #[cfg(windows)]
     wmi_con:     Option<WMIConnection>,
     #[cfg(windows)]
@@ -139,18 +148,37 @@ impl Monitor {
         #[cfg(not(windows))]
         let _ = ();
 
-        Monitor {
+        // Restore persisted fan overrides from AppData JSON
+        let saved = settings::load();
+        let fan_overrides: HashMap<u32, u32> = saved
+            .fan_overrides
+            .iter()
+            .map(|s| (s.gpu_index, s.speed))
+            .collect();
+
+        let monitor = Monitor {
             nvml,
             nvml_fan,
             sys,
             components,
-            fan_overrides: HashMap::new(),
+            fan_overrides,
             safety_active: HashSet::new(),
+            cooldown_ticks: HashMap::new(),
             #[cfg(windows)]
             wmi_con,
             #[cfg(windows)]
             wmi_thermal,
+        };
+
+        // Apply restored overrides immediately
+        let indices: Vec<u32> = monitor.fan_overrides.keys().copied().collect();
+        for idx in indices {
+            let speed = monitor.fan_overrides[&idx];
+            monitor.apply_fan_raw(idx, speed);
+            eprintln!("[HybridGauge] Restored fan override GPU{}: {}%", idx, speed);
         }
+
+        monitor
     }
 
     pub fn collect(&mut self) -> SystemMetrics {
@@ -187,6 +215,41 @@ impl Monitor {
             }
         }
 
+        // ── Cool-down: GPU load ≤ 20% for 30s → reset manual fan to auto ──
+        let mut cooldown_resets: Vec<u32> = Vec::new();
+        for gpu in &nvidia_gpus {
+            let Some(load) = gpu.utilization_gpu else { continue };
+            let idx = gpu.index;
+
+            if !self.fan_overrides.contains_key(&idx) {
+                self.cooldown_ticks.remove(&idx);
+                continue;
+            }
+
+            if load <= 20 {
+                let ticks = self.cooldown_ticks.entry(idx).or_insert(0);
+                *ticks += 1;
+                if *ticks >= 30 {
+                    cooldown_resets.push(idx);
+                }
+            } else {
+                self.cooldown_ticks.remove(&idx);
+            }
+        }
+        for idx in cooldown_resets {
+            eprintln!(
+                "[HybridGauge] Cool-down: GPU{} idle 30s → fan auto",
+                idx
+            );
+            self.fan_overrides.remove(&idx);
+            self.cooldown_ticks.remove(&idx);
+            self.reset_fan_raw(idx);
+            self.persist_settings();
+        }
+
+        // Rebuild nvidia_gpus with updated cooldown_secs / fan_override fields
+        let nvidia_gpus = self.collect_nvidia();
+
         SystemMetrics {
             nvidia_gpus,
             amd_gpus: self.collect_amd(),
@@ -211,7 +274,7 @@ impl Monitor {
             Some(s) => {
                 let s = s.min(100);
                 self.fan_overrides.insert(index, s);
-                // Don't override safety mode
+                self.cooldown_ticks.remove(&index); // reset cooldown on manual change
                 if !self.safety_active.contains(&index) {
                     self.apply_fan_raw(index, s);
                 }
@@ -219,10 +282,23 @@ impl Monitor {
             None => {
                 self.fan_overrides.remove(&index);
                 self.safety_active.remove(&index);
+                self.cooldown_ticks.remove(&index);
                 self.reset_fan_raw(index);
             }
         }
+        self.persist_settings();
         Ok(())
+    }
+
+    fn persist_settings(&self) {
+        let s = AppSettings {
+            fan_overrides: self
+                .fan_overrides
+                .iter()
+                .map(|(&gpu_index, &speed)| FanOverrideSetting { gpu_index, speed })
+                .collect(),
+        };
+        settings::save(&s);
     }
 
     // ── NVIDIA ──────────────────────────────────
@@ -259,6 +335,8 @@ impl Monitor {
                 vram_total_mb:          mem.as_ref().map(|m| m.total >> 20),
                 fan_control_available,
                 safety_override_active: self.safety_active.contains(&i),
+                fan_override:           self.fan_overrides.get(&i).copied(),
+                cooldown_secs:          self.cooldown_ticks.get(&i).copied(),
             });
         }
         out
