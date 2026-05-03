@@ -1,0 +1,28 @@
+# Rust build artifacts
+target/
+
+# Node
+node_modules/
+dist/
+
+# Tauri bundler downloads (re-downloaded automatically)
+src-tauri/WixTools/
+src-tauri/nsis/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
