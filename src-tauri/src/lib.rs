@@ -1,3 +1,4 @@
+mod lhm_bridge;
 mod monitor;
 mod settings;
 use monitor::{FanCommand, Monitor};

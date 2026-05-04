@@ -46,7 +46,7 @@ function Card({ title, accent, children }) {
 // ── Fan Speed Slider ───────────────────────────────────────────────
 // override: null = auto mode, number = manual speed %
 
-function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActive, override, onOverrideChange, cooldownSecs }) {
+function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActive, override, onOverrideChange, cooldownSecs, unavailableNote }) {
   const isManual = override !== null && override !== undefined;
   const sliderVal = isManual ? override : (currentFanSpeed ?? 50);
 
@@ -64,7 +64,11 @@ function FanSlider({ gpuIndex, currentFanSpeed, fanControlAvailable, safetyActiv
   }, [gpuIndex, onOverrideChange]);
 
   if (!fanControlAvailable) {
-    return <p className="note">ファン手動制御: NVIDIAドライバー 520+ が必要です</p>;
+    return (
+      <p className="note">
+        {unavailableNote ?? "ファン手動制御が利用できません"}
+      </p>
+    );
   }
 
   return (
@@ -142,6 +146,7 @@ function NvidiaCard({ gpu, fanOverride, onOverrideChange }) {
         override={fanOverride}
         onOverrideChange={onOverrideChange}
         cooldownSecs={gpu.cooldown_secs}
+        unavailableNote="ファン手動制御: NVIDIAドライバー 520+ が必要です"
       />
     </Card>
   );
@@ -163,8 +168,8 @@ function AmdCard({ gpu, fanOverride, onOverrideChange }) {
       {gpu.vram_mb && (
         <Metric icon={Database}  label="VRAM"          value={gpu.vram_mb} unit=" MB" color="#9c27b0" />
       )}
-      {gpu.temperature == null && !gpu.fan_control_available && (
-        <p className="note">温度取得不可: LibreHardwareMonitorのインストールを推奨</p>
+      {gpu.temperature == null && (
+        <p className="note">温度取得不可: LibreHardwareMonitor を起動するか atiadlxx.dll を確認してください</p>
       )}
       <FanSlider
         gpuIndex={gpu.index}
@@ -174,6 +179,7 @@ function AmdCard({ gpu, fanOverride, onOverrideChange }) {
         override={fanOverride}
         onOverrideChange={onOverrideChange}
         cooldownSecs={gpu.cooldown_secs}
+        unavailableNote="ファン手動制御: atiadlxx.dll または OverdriveN API が利用不可"
       />
     </Card>
   );
@@ -184,6 +190,9 @@ function CpuCard({ cpu }) {
     <Card title={`CPU — ${cpu.name}`} accent="#2196f3">
       <Metric icon={Zap}         label="全コア合計"     value={Math.round(cpu.overall_usage)} unit="%" bar={100} color="#2196f3" />
       <Metric icon={Thermometer} label="温度 (Package)" value={cpu.package_temp != null ? Math.round(cpu.package_temp) : null} unit="°C" bar={110} color="#ff9800" />
+      {cpu.package_temp == null && (
+        <p className="note">CPU温度取得不可: LibreHardwareMonitor を起動してください</p>
+      )}
       <div className="core-grid">
         {cpu.core_usages.map((usage, i) => (
           <div key={i} className="core-cell">
