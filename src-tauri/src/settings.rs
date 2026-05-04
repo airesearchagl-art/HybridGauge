@@ -3,15 +3,22 @@ use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct AppSettings {
-    /// Manual fan overrides to restore on next launch.
     #[serde(default)]
     pub fan_overrides: Vec<FanOverrideSetting>,
+    #[serde(default)]
+    pub amd_fan_overrides: Vec<AmdFanOverrideSetting>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FanOverrideSetting {
     pub gpu_index: u32,
-    pub speed: u32, // 0–100 %
+    pub speed: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AmdFanOverrideSetting {
+    pub gpu_position: usize,
+    pub speed: u32,
 }
 
 /// Returns the path to the JSON settings file inside the OS AppData directory.

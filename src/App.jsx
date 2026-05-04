@@ -147,17 +147,34 @@ function NvidiaCard({ gpu, fanOverride, onOverrideChange }) {
   );
 }
 
-function AmdCard({ gpu }) {
+function AmdCard({ gpu, fanOverride, onOverrideChange }) {
   return (
     <Card title={`AMD — ${gpu.name}`} accent="#ed1c24">
       <Metric icon={Activity}    label="GPU Load (3D)" value={gpu.utilization_3d != null ? Math.round(gpu.utilization_3d) : null} unit="%" bar={100} color="#ed1c24" />
-      <Metric icon={Thermometer} label="温度"           value={gpu.temperature != null ? Math.round(gpu.temperature) : null}       unit="°C" bar={110} color="#ff9800" />
+      <Metric
+        icon={Thermometer}
+        label="温度"
+        value={gpu.temperature != null ? Math.round(gpu.temperature) : null}
+        unit="°C"
+        bar={110}
+        color={gpu.temperature >= 85 ? "#f44336" : "#ff9800"}
+      />
+      <Metric icon={Wind}        label="ファン速度"     value={gpu.fan_speed} unit="%" bar={100} color="#03a9f4" />
       {gpu.vram_mb && (
         <Metric icon={Database}  label="VRAM"          value={gpu.vram_mb} unit=" MB" color="#9c27b0" />
       )}
-      {gpu.temperature === null && (
+      {gpu.temperature == null && !gpu.fan_control_available && (
         <p className="note">温度取得不可: LibreHardwareMonitorのインストールを推奨</p>
       )}
+      <FanSlider
+        gpuIndex={gpu.index}
+        currentFanSpeed={gpu.fan_speed}
+        fanControlAvailable={gpu.fan_control_available}
+        safetyActive={gpu.safety_override_active}
+        override={fanOverride}
+        onOverrideChange={onOverrideChange}
+        cooldownSecs={gpu.cooldown_secs}
+      />
     </Card>
   );
 }
@@ -188,7 +205,8 @@ export default function App() {
   const [metrics, setMetrics]       = useState(null);
   const [tick, setTick]             = useState(0);
   // fanOverrides: { [gpuIndex]: number | null }  null = auto
-  const [fanOverrides, setFanOverrides] = useState({});
+  const [fanOverrides, setFanOverrides]       = useState({});
+  const [amdFanOverrides, setAmdFanOverrides] = useState({});
   const [presetActive, setPresetActive] = useState(false);
 
   useEffect(() => {
@@ -201,6 +219,13 @@ export default function App() {
       setFanOverrides(prev => {
         const next = { ...prev };
         payload.nvidia_gpus.forEach(gpu => {
+          next[gpu.index] = gpu.fan_override ?? null;
+        });
+        return next;
+      });
+      setAmdFanOverrides(prev => {
+        const next = { ...prev };
+        payload.amd_gpus.forEach(gpu => {
           next[gpu.index] = gpu.fan_override ?? null;
         });
         return next;
@@ -230,6 +255,16 @@ export default function App() {
     );
     setPresetActive(true);
   }, [metrics, handleOverrideChange]);
+
+  // AMD fan override handler
+  const handleAmdOverrideChange = useCallback(async (index, speed) => {
+    try {
+      await invoke("set_amd_fan_speed", { index, speed: speed ?? null });
+      setAmdFanOverrides(prev => ({ ...prev, [index]: speed ?? null }));
+    } catch (e) {
+      console.error("set_amd_fan_speed failed:", e);
+    }
+  }, []);
 
   // Detect when user manually moves a slider away from preset — clear preset indicator
   const handleOverrideChangeWithPresetReset = useCallback(async (index, speed) => {
@@ -271,8 +306,13 @@ export default function App() {
               onOverrideChange={handleOverrideChangeWithPresetReset}
             />
           ))}
-          {metrics.amd_gpus.map((gpu, i) => (
-            <AmdCard key={i} gpu={gpu} />
+          {metrics.amd_gpus.map((gpu) => (
+            <AmdCard
+              key={gpu.index}
+              gpu={gpu}
+              fanOverride={amdFanOverrides[gpu.index] ?? null}
+              onOverrideChange={handleAmdOverrideChange}
+            />
           ))}
           {metrics.nvidia_gpus.length === 0 && metrics.amd_gpus.length === 0 && (
             <p className="note" style={{ gridColumn: "1 / -1" }}>

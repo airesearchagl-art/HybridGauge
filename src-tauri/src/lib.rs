@@ -1,6 +1,7 @@
 mod monitor;
 mod settings;
 use monitor::{FanCommand, Monitor};
+
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 use tauri::{Emitter, State};
@@ -15,6 +16,17 @@ fn set_fan_speed(
 ) -> Result<(), String> {
     ctrl.0
         .send(FanCommand::Set { index, speed })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_amd_fan_speed(
+    ctrl: State<FanControl>,
+    index: usize,
+    speed: Option<u32>,
+) -> Result<(), String> {
+    ctrl.0
+        .send(FanCommand::SetAmd { index, speed })
         .map_err(|e| e.to_string())
 }
 
@@ -47,7 +59,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_fan_speed])
+        .invoke_handler(tauri::generate_handler![set_fan_speed, set_amd_fan_speed])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
