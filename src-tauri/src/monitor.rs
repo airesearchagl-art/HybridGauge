@@ -2,7 +2,11 @@ use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use sysinfo::{Components, CpuRefreshKind, RefreshKind, System};
+
+static PM_LOG_DUMPED:      AtomicBool = AtomicBool::new(false);
+static WMI_ENGINE_DUMPED:  AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 use wmi::{COMLibrary, Variant, WMIConnection};
@@ -55,6 +59,71 @@ type Adl2OdnFanControlGetFn =
     unsafe extern "C" fn(*mut c_void, i32, *mut AdlOdnFanControl) -> i32;
 type Adl2OdnFanControlSetFn =
     unsafe extern "C" fn(*mut c_void, i32, *mut AdlOdnFanControl) -> i32;
+// RDNA 4+ temperature (millidegrees Celsius)
+type Adl2Od10TemperatureGetFn =
+    unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32) -> i32;
+// Universal PM log data (all modern AMD GPUs incl. RDNA 4)
+type Adl2NewQueryPmLogDataGetFn =
+    unsafe extern "C" fn(*mut c_void, i32, *mut AdlPmLogDataOutput) -> i32;
+// hDevice=0 means "no D3D device; use SMU polling" — safe for monitoring tools
+type Adl2NewQueryPmLogDataStartFn =
+    unsafe extern "C" fn(*mut c_void, i32, *const AdlPmLogStartInput, *mut AdlPmLogStartOutput, usize) -> i32;
+type Adl2NewQueryPmLogDataStopFn =
+    unsafe extern "C" fn(*mut c_void, i32) -> i32;
+
+const PMLOG_MAX_SENSORS:      usize = 256;
+const PMLOG_TEMPERATURE_EDGE: usize = 7;  // GPU edge/junction temperature
+const PMLOG_TEMPERATURE_MEM:  usize = 8;  // GPU memory temperature
+const PMLOG_TEMPERATURE_HOT:  usize = 25; // GPU hotspot temperature
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdlSingleSensorData {
+    ul_active: i32,
+    value:     f32,
+}
+
+impl Default for AdlSingleSensorData {
+    fn default() -> Self { AdlSingleSensorData { ul_active: 0, value: 0.0 } }
+}
+
+#[repr(C)]
+struct AdlPmLogDataOutput {
+    ul_version:           i32,
+    ul_num_logged_values: i32,
+    a_logged_values:      [AdlSingleSensorData; PMLOG_MAX_SENSORS],
+}
+
+impl Default for AdlPmLogDataOutput {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+// Sensor IDs to start monitoring (terminated by 0xFFFF)
+const PM_LOG_SENSOR_IDS: &[u16] = &[
+    7,   // TEMPERATURE_EDGE
+    8,   // TEMPERATURE_MEM
+    14,  // FAN_RPM
+    15,  // FAN_PERCENTAGE
+    19,  // INFO_ACTIVITY_GFX
+    25,  // TEMPERATURE_HOTSPOT
+    0xFFFF,
+];
+
+#[repr(C)]
+struct AdlPmLogStartInput {
+    us_sensors:     [u16; PMLOG_MAX_SENSORS],
+    ul_sample_rate: u32, // milliseconds
+}
+
+impl Default for AdlPmLogStartInput {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct AdlPmLogStartOutput {
+    p_logging_address: usize, // void* — mapped buffer, unused by us
+}
 
 // ADLAdapterInfo layout (Windows 64-bit, 1572 bytes, Pack=1)
 #[repr(C)]
@@ -111,14 +180,18 @@ unsafe extern "C" fn adl_malloc_fn(size: i32) -> *mut c_void {
 }
 
 pub struct AdlFanControl {
-    _lib:         libloading::Library,
-    context:      *mut c_void,
+    _lib:            libloading::Library,
+    context:         *mut c_void,
     /// (ADL adapter index, display name) — AMD GPUs only, in enumeration order
-    amd_adapters: Vec<(i32, String)>,
-    destroy_fn:   Adl2MainControlDestroyFn,
-    temp_get_fn:  Adl2OdnTemperatureGetFn,
-    fan_get_fn:   Adl2OdnFanControlGetFn,
-    fan_set_fn:   Adl2OdnFanControlSetFn,
+    amd_adapters:    Vec<(i32, String)>,
+    destroy_fn:      Adl2MainControlDestroyFn,
+    temp_get_fn:     Adl2OdnTemperatureGetFn,
+    od10_temp_fn:    Option<Adl2Od10TemperatureGetFn>,
+    pm_log_fn:       Option<Adl2NewQueryPmLogDataGetFn>,
+    pm_log_stop_fn:  Option<Adl2NewQueryPmLogDataStopFn>,
+    pm_log_started:  Vec<i32>, // adapter indices with active PM log sessions
+    fan_get_fn:      Adl2OdnFanControlGetFn,
+    fan_set_fn:      Adl2OdnFanControlSetFn,
 }
 
 unsafe impl Send for AdlFanControl {}
@@ -126,6 +199,11 @@ unsafe impl Send for AdlFanControl {}
 impl Drop for AdlFanControl {
     fn drop(&mut self) {
         if !self.context.is_null() {
+            if let Some(stop_fn) = self.pm_log_stop_fn {
+                for &adl_idx in &self.pm_log_started {
+                    unsafe { stop_fn(self.context, adl_idx) };
+                }
+            }
             unsafe { (self.destroy_fn)(self.context) };
         }
     }
@@ -133,97 +211,206 @@ impl Drop for AdlFanControl {
 
 impl AdlFanControl {
     fn try_init() -> Option<Self> {
-        unsafe {
-            let lib = libloading::Library::new("atiadlxx.dll").ok()?;
+        // AssertUnwindSafe: ADL FFI is not unwind-safe by default; we assert it here
+        // because we validate all pointers and return values within try_init_inner.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe { Self::try_init_inner() }
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("[HybridGauge] ADL init panicked — AMD fan control unavailable");
+            None
+        })
+    }
 
-            let create_fn: Adl2MainControlCreateFn =
-                *lib.get(b"ADL2_Main_Control_Create\0").ok()?;
-            let destroy_fn: Adl2MainControlDestroyFn =
-                *lib.get(b"ADL2_Main_Control_Destroy\0").ok()?;
-            let num_adapters_fn: Adl2AdapterNumberOfAdaptersGetFn =
-                *lib.get(b"ADL2_Adapter_NumberOfAdapters_Get\0").ok()?;
-            let adapter_info_fn: Adl2AdapterAdapterInfoGetFn =
-                *lib.get(b"ADL2_Adapter_AdapterInfo_Get\0").ok()?;
-            let temp_get_fn: Adl2OdnTemperatureGetFn =
-                *lib.get(b"ADL2_OverdriveN_Temperature_Get\0").ok()?;
-            let fan_get_fn: Adl2OdnFanControlGetFn =
-                *lib.get(b"ADL2_OverdriveN_FanControl_Get\0").ok()?;
-            let fan_set_fn: Adl2OdnFanControlSetFn =
-                *lib.get(b"ADL2_OverdriveN_FanControl_Set\0").ok()?;
+    unsafe fn try_init_inner() -> Option<Self> {
+        let lib = libloading::Library::new("atiadlxx.dll").ok()?;
 
-            let mut context: *mut c_void = std::ptr::null_mut();
-            if create_fn(adl_malloc_fn, 1, &mut context) != 0 || context.is_null() {
-                return None;
-            }
-
-            let mut num = 0i32;
-            if num_adapters_fn(context, &mut num) != 0 || num <= 0 {
-                destroy_fn(context);
-                return None;
-            }
-
-            let total_bytes = std::mem::size_of::<AdlAdapterInfo>() as i32 * num;
-            let mut infos: Vec<AdlAdapterInfo> =
-                (0..num).map(|_| AdlAdapterInfo::default()).collect();
-            if !infos.is_empty() {
-                infos[0].i_size = std::mem::size_of::<AdlAdapterInfo>() as i32;
-            }
-            let ret = adapter_info_fn(context, infos.as_mut_ptr(), total_bytes);
-
-            let amd_adapters: Vec<(i32, String)> = if ret == 0 {
-                infos.iter()
-                    .filter(|i| i.i_vendor_id == 0x1002 && i.i_present != 0)
-                    .map(|i| (i.i_adapter_index, i.adapter_name()))
-                    .collect()
-            } else {
-                // Fallback: probe each index by temperature
-                (0..num).filter_map(|i| {
-                    let mut t = 0i32;
-                    if temp_get_fn(context, i, 1, &mut t) == 0 {
-                        Some((i, format!("AMD GPU {i}")))
-                    } else {
-                        None
-                    }
-                }).collect()
-            };
-
-            if amd_adapters.is_empty() {
-                destroy_fn(context);
-                return None;
-            }
-
-            eprintln!(
-                "[HybridGauge] ADL ready ({} AMD adapter(s))",
-                amd_adapters.len()
-            );
-            Some(AdlFanControl {
-                _lib: lib, context, amd_adapters,
-                destroy_fn, temp_get_fn, fan_get_fn, fan_set_fn,
-            })
+        let create_fn: Adl2MainControlCreateFn =
+            *lib.get(b"ADL2_Main_Control_Create\0").ok()?;
+        let destroy_fn: Adl2MainControlDestroyFn =
+            *lib.get(b"ADL2_Main_Control_Destroy\0").ok()?;
+        let num_adapters_fn: Adl2AdapterNumberOfAdaptersGetFn =
+            *lib.get(b"ADL2_Adapter_NumberOfAdapters_Get\0").ok()?;
+        let adapter_info_fn: Adl2AdapterAdapterInfoGetFn =
+            *lib.get(b"ADL2_Adapter_AdapterInfo_Get\0").ok()?;
+        let temp_get_fn: Adl2OdnTemperatureGetFn =
+            *lib.get(b"ADL2_OverdriveN_Temperature_Get\0").ok()?;
+        // Optional: RDNA 4+ Overdrive10 temperature (returns millidegrees)
+        let od10_temp_fn: Option<Adl2Od10TemperatureGetFn> =
+            lib.get::<Adl2Od10TemperatureGetFn>(b"ADL2_Overdrive10_Temperature_Get\0")
+               .ok().map(|f| *f);
+        if od10_temp_fn.is_some() {
+            eprintln!("[HybridGauge] ADL: Overdrive10 temperature available");
         }
+        // Optional: PM log data (RDNA 2–4, returns values[] indexed by PMLOG_* sensor IDs)
+        let pm_log_fn: Option<Adl2NewQueryPmLogDataGetFn> =
+            lib.get::<Adl2NewQueryPmLogDataGetFn>(b"ADL2_New_QueryPMLogData_Get\0")
+               .ok().map(|f| *f);
+        let pm_log_start_fn: Option<Adl2NewQueryPmLogDataStartFn> =
+            lib.get::<Adl2NewQueryPmLogDataStartFn>(b"ADL2_New_QueryPMLogData_Start\0")
+               .ok().map(|f| *f);
+        let pm_log_stop_fn: Option<Adl2NewQueryPmLogDataStopFn> =
+            lib.get::<Adl2NewQueryPmLogDataStopFn>(b"ADL2_New_QueryPMLogData_Stop\0")
+               .ok().map(|f| *f);
+        if pm_log_fn.is_some() {
+            eprintln!("[HybridGauge] ADL: PM log available (start={} stop={})",
+                pm_log_start_fn.is_some(), pm_log_stop_fn.is_some());
+        }
+        let fan_get_fn: Adl2OdnFanControlGetFn =
+            *lib.get(b"ADL2_OverdriveN_FanControl_Get\0").ok()?;
+        let fan_set_fn: Adl2OdnFanControlSetFn =
+            *lib.get(b"ADL2_OverdriveN_FanControl_Set\0").ok()?;
+
+        let mut context: *mut c_void = std::ptr::null_mut();
+        let rc = create_fn(adl_malloc_fn, 1, &mut context);
+        if rc != 0 || context.is_null() {
+            eprintln!("[HybridGauge] ADL2_Main_Control_Create failed: {rc} (0x{rc:08x})");
+            return None;
+        }
+
+        let mut num = 0i32;
+        let rc = num_adapters_fn(context, &mut num);
+        if rc != 0 || num <= 0 || num > 64 {
+            eprintln!("[HybridGauge] ADL2_Adapter_NumberOfAdapters_Get failed: rc={rc} num={num}");
+            destroy_fn(context);
+            return None;
+        }
+
+        let struct_size = std::mem::size_of::<AdlAdapterInfo>() as i32;
+        let total_bytes = struct_size * num;
+        let mut infos: Vec<AdlAdapterInfo> =
+            (0..num).map(|_| AdlAdapterInfo::default()).collect();
+        infos[0].i_size = struct_size;
+        let ret = adapter_info_fn(context, infos.as_mut_ptr(), total_bytes);
+        eprintln!("[HybridGauge] ADL: num_adapters={num} AdapterInfo_ret={ret} struct_size={struct_size}");
+
+        let amd_adapters: Vec<(i32, String)> = if ret == 0 {
+            // ADL vendor IDs are decimal: AMD = 1002 (0x03EA), not PCI VID 0x1002
+            infos.iter()
+                .filter(|i| i.i_vendor_id == 1002 && i.i_present != 0 && i.i_adapter_index >= 0)
+                .map(|i| (i.i_adapter_index, i.adapter_name()))
+                .collect()
+        } else {
+            eprintln!("[HybridGauge] ADL2_Adapter_AdapterInfo_Get err {ret} (0x{ret:08x}) — probing by temperature");
+            // Fallback: probe each index by temperature
+            (0..num).filter_map(|i| {
+                let mut t = 0i32;
+                let tret = temp_get_fn(context, i, 1, &mut t);
+                eprintln!("[HybridGauge]   probe adapter {i}: temp_ret={tret} t={t}");
+                if tret == 0 {
+                    Some((i, format!("AMD GPU {i}")))
+                } else {
+                    None
+                }
+            }).collect()
+        };
+
+        if amd_adapters.is_empty() {
+            eprintln!("[HybridGauge] ADL: no AMD adapters found");
+            destroy_fn(context);
+            return None;
+        }
+
+        let first_name = amd_adapters.first().map(|(_, n)| n.as_str()).unwrap_or("?");
+        eprintln!("[HybridGauge] ADL ready ({} logical adapter(s)) — {first_name}", amd_adapters.len());
+
+        // Start PM log session on the first physical adapter (others are virtual display outputs)
+        let mut pm_log_started: Vec<i32> = Vec::new();
+        if let (Some(start_fn), Some(&(first_idx, _))) =
+            (pm_log_start_fn, amd_adapters.first())
+        {
+            let mut input = AdlPmLogStartInput { ul_sample_rate: 250, ..Default::default() };
+            for (i, &s) in PM_LOG_SENSOR_IDS.iter().enumerate() {
+                input.us_sensors[i] = s;
+            }
+            let mut output = AdlPmLogStartOutput::default();
+            // hDevice=0: use SMU polling (no D3D device required)
+            let ret = start_fn(context, first_idx, &input, &mut output, 0);
+            eprintln!("[HybridGauge] PM log start adapter {first_idx}: ret={ret} (0x{ret:08x})");
+            if ret == 0 {
+                pm_log_started.push(first_idx);
+                eprintln!("[HybridGauge] PM log active — sensor sampling at 250ms");
+            }
+        }
+
+        Some(AdlFanControl {
+            _lib: lib, context, amd_adapters,
+            destroy_fn, temp_get_fn, od10_temp_fn,
+            pm_log_fn, pm_log_stop_fn, pm_log_started,
+            fan_get_fn, fan_set_fn,
+        })
     }
 
     fn temperature(&self, adl_idx: i32) -> Option<f32> {
+        if self.context.is_null() || adl_idx < 0 { return None; }
+
+        // OverdriveN: some drivers return millidegrees (RDNA), others return Celsius (Polaris/Vega)
         let mut t = 0i32;
         let ret = unsafe { (self.temp_get_fn)(self.context, adl_idx, 1, &mut t) };
-        if ret == 0 && t > 0 { Some(t as f32) } else { None }
+        if ret == 0 && t > 0 {
+            let celsius = if t >= 1000 { t as f32 / 1000.0 } else { t as f32 };
+            if celsius < 150.0 {
+                return Some(celsius);
+            }
+        }
+
+        // Overdrive10 fallback for RDNA 4+ (always millidegrees)
+        if let Some(od10_fn) = self.od10_temp_fn {
+            let mut t10 = 0i32;
+            let ret10 = unsafe { od10_fn(self.context, adl_idx, 1, &mut t10) };
+            if ret10 == 0 && t10 > 0 {
+                let celsius = if t10 >= 1000 { t10 as f32 / 1000.0 } else { t10 as f32 };
+                if celsius < 150.0 {
+                    return Some(celsius);
+                }
+            }
+        }
+
+        // PM Log Data — works on RDNA 2/3/4 when session is started
+        if let Some(pm_fn) = self.pm_log_fn {
+            let mut data = AdlPmLogDataOutput::default();
+            let ret = unsafe { pm_fn(self.context, adl_idx, &mut data) };
+            if !PM_LOG_DUMPED.swap(true, Ordering::Relaxed) {
+                let active: Vec<_> = data.a_logged_values.iter().enumerate()
+                    .filter(|(_, s)| s.ul_active != 0 && s.value != 0.0)
+                    .map(|(i, s)| format!("[{i}]={:.1}", s.value))
+                    .collect();
+                eprintln!("[HybridGauge] PM log adapter {adl_idx} ret={ret}: {}", active.join(" "));
+            }
+            if ret == 0 {
+                for &idx in &[PMLOG_TEMPERATURE_EDGE, PMLOG_TEMPERATURE_HOT, PMLOG_TEMPERATURE_MEM] {
+                    let s = &data.a_logged_values[idx];
+                    if s.ul_active != 0 && s.value > 0.0 && s.value < 150.0 {
+                        return Some(s.value);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn fan_speed_pct(&self, adl_idx: i32) -> Option<u32> {
+        if self.context.is_null() || adl_idx < 0 { return None; }
         let mut ctrl = AdlOdnFanControl::default();
-        if unsafe { (self.fan_get_fn)(self.context, adl_idx, &mut ctrl) } != 0 {
-            return None;
-        }
-        if ctrl.i_current_fan_speed_mode == 1 {
-            Some(ctrl.i_current_fan_speed.clamp(0, 100) as u32)
-        } else if ctrl.i_fan_control_mode == 1 {
-            Some(ctrl.i_target_fan_speed.clamp(0, 100) as u32)
+        let ret = unsafe { (self.fan_get_fn)(self.context, adl_idx, &mut ctrl) };
+        if ret != 0 { return None; }
+        // Guard against garbage values from the driver
+        if ctrl.i_current_fan_speed_mode == 1
+            && (0..=100).contains(&ctrl.i_current_fan_speed)
+        {
+            Some(ctrl.i_current_fan_speed as u32)
+        } else if ctrl.i_fan_control_mode == 1
+            && (0..=100).contains(&ctrl.i_target_fan_speed)
+        {
+            Some(ctrl.i_target_fan_speed as u32)
         } else {
             None
         }
     }
 
     fn set_fan(&self, adl_idx: i32, pct: u32) -> bool {
+        if self.context.is_null() || adl_idx < 0 { return false; }
         let mut ctrl = AdlOdnFanControl {
             i_mode:                   1,
             i_fan_control_mode:       1,
@@ -234,20 +421,25 @@ impl AdlFanControl {
         };
         let ret = unsafe { (self.fan_set_fn)(self.context, adl_idx, &mut ctrl) };
         if ret != 0 {
-            eprintln!("[HybridGauge] ADL SetFan adapter{adl_idx} {pct}%: err {ret}");
+            eprintln!("[HybridGauge] ADL SetFan adapter{adl_idx} {pct}%: err {ret} (0x{ret:08x})");
         }
         ret == 0
     }
 
     fn reset_fan(&self, adl_idx: i32) -> bool {
+        if self.context.is_null() || adl_idx < 0 { return false; }
         let mut ctrl = AdlOdnFanControl {
             i_mode: 0, i_fan_control_mode: 0, ..Default::default()
         };
-        unsafe { (self.fan_set_fn)(self.context, adl_idx, &mut ctrl) == 0 }
+        let ret = unsafe { (self.fan_set_fn)(self.context, adl_idx, &mut ctrl) };
+        ret == 0
     }
 
     fn adl_index(&self, position: usize) -> Option<i32> {
-        self.amd_adapters.get(position).map(|(idx, _)| *idx)
+        self.amd_adapters
+            .get(position)
+            .map(|(idx, _)| *idx)
+            .filter(|&idx| idx >= 0)
     }
 }
 
@@ -287,7 +479,8 @@ pub struct NvidiaGpuMetrics {
 pub struct AmdGpuMetrics {
     pub index:                  usize,
     pub name:                   String,
-    pub vram_mb:                Option<u64>,
+    pub vram_used_mb:           Option<u64>,
+    pub vram_total_mb:          Option<u64>,
     pub utilization_3d:         Option<f64>,
     pub temperature:            Option<f32>,
     pub fan_speed:              Option<u32>, // control % (ADL or LHM /control/)
@@ -299,11 +492,20 @@ pub struct AmdGpuMetrics {
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct SystemMemoryMetrics {
+    pub used_gb:  f32,
+    pub total_gb: f32,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct CpuMetrics {
     pub name:          String,
     pub overall_usage: f32,
     pub core_usages:   Vec<f32>,
     pub package_temp:  Option<f32>,
+    pub fan_rpm:       Option<u32>,
+    pub ram:           Option<SystemMemoryMetrics>,
+    pub npu_usage:     Option<f64>,
 }
 
 // ── Monitor ───────────────────────────────────────────────────────────
@@ -620,51 +822,65 @@ impl Monitor {
             .into_iter()
             .enumerate()
             .map(|(pos, (name, _compat, vram_bytes))| {
-                // Identifier rules confirmed from LHM report:
-                //   temperature : /gpu-amd/<N>/temperature/<N>
-                //   fan RPM     : /gpu-amd/<N>/fan/<N>
-                //   fan control : /gpu-amd/<N>/control/<N>
-                // intel-integrated GPUs must be excluded entirely.
+                // Identifiers confirmed from LHM report (RX 9070 XT):
+                //   temperature : /gpu-amd/0/temperature/0
+                //   fan RPM     : /gpu-amd/0/fan/0
+                //   fan control : /gpu-amd/0/control/0
+                // Try exact match first; fall back to filter_by_id if not found.
 
                 // ── Temperature: LHM → ADL → sysinfo/WMI ──────────────
                 let lhm_temp: Option<f32> = lhm.and_then(|sensors| {
-                    lhm_bridge::filter_by_id(
-                        sensors,
-                        &["/gpu-amd/", "/temperature"],
-                        &["intel"],
-                    )
-                    .into_iter()
-                    .nth(pos)
-                    .map(|s| s.value)
-                    .filter(|&v| v > 0.0 && v < 150.0)
+                    let exact_id = format!("/gpu-amd/{pos}/temperature/0");
+                    lhm_bridge::find_by_id(sensors, &exact_id)
+                        .map(|s| s.value)
+                        .filter(|&v| v > 0.0 && v < 150.0)
+                        .or_else(|| {
+                            lhm_bridge::filter_by_id(
+                                sensors, &["/gpu-amd/", "/temperature"], &["intel"],
+                            )
+                            .into_iter()
+                            .nth(pos)
+                            .map(|s| s.value)
+                            .filter(|&v| v > 0.0 && v < 150.0)
+                        })
                 });
 
-                // ── Fan RPM from LHM (/gpu-amd/N/fan/N) ───────────────
+                // ── Fan RPM from LHM (/gpu-amd/N/fan/0) ───────────────
                 let lhm_fan_rpm: Option<u32> = lhm.and_then(|sensors| {
-                    lhm_bridge::filter_by_id(
-                        sensors,
-                        &["/gpu-amd/", "/fan"],
-                        &["intel"],
-                    )
-                    .into_iter()
-                    .nth(pos)
-                    .map(|s| s.value as u32)
-                    .filter(|&v| v > 0)
+                    let exact_id = format!("/gpu-amd/{pos}/fan/0");
+                    lhm_bridge::find_by_id(sensors, &exact_id)
+                        .map(|s| s.value as u32)
+                        .filter(|&v| v > 0)
+                        .or_else(|| {
+                            lhm_bridge::filter_by_id(
+                                sensors, &["/gpu-amd/", "/fan"], &["intel"],
+                            )
+                            .into_iter()
+                            .nth(pos)
+                            .map(|s| s.value as u32)
+                            .filter(|&v| v > 0)
+                        })
                 });
 
-                // ── Fan control % from LHM (/gpu-amd/N/control/N) ─────
+                // ── Fan control % from LHM (/gpu-amd/N/control/0) ─────
                 let lhm_fan_pct: Option<u32> = lhm.and_then(|sensors| {
-                    lhm_bridge::filter_by_id(
-                        sensors,
-                        &["/gpu-amd/", "/control"],
-                        &["intel"],
-                    )
-                    .into_iter()
-                    .nth(pos)
-                    .and_then(|s| {
-                        let v = s.value;
-                        if v >= 0.0 && v <= 100.0 { Some(v as u32) } else { None }
-                    })
+                    let exact_id = format!("/gpu-amd/{pos}/control/0");
+                    lhm_bridge::find_by_id(sensors, &exact_id)
+                        .and_then(|s| {
+                            let v = s.value;
+                            if v >= 0.0 && v <= 100.0 { Some(v as u32) } else { None }
+                        })
+                        .or_else(|| {
+                            lhm_bridge::filter_by_id(
+                                sensors, &["/gpu-amd/", "/control"], &["intel"],
+                            )
+                            .into_iter()
+                            .nth(pos)
+                            .and_then(|s| {
+                                let v = s.value;
+                                if v >= 0.0 && v <= 100.0 { Some(v as u32) } else { None }
+                            })
+                        })
                 });
 
                 let adl_idx = self.adl_fan.as_ref().and_then(|adl| adl.adl_index(pos));
@@ -679,10 +895,21 @@ impl Monitor {
                     .and_then(|idx| self.adl_fan.as_ref().unwrap().fan_speed_pct(idx))
                     .or(lhm_fan_pct);
 
+                // VRAM: LHM smalldata/1 = used MB, smalldata/2 = total MB
+                let vram_used_mb = lhm.and_then(|sensors| {
+                    lhm_bridge::find_by_id(sensors, &format!("/gpu-amd/{pos}/smalldata/1"))
+                        .map(|s| s.value as u64).filter(|&v| v > 0)
+                });
+                let vram_total_mb = lhm.and_then(|sensors| {
+                    lhm_bridge::find_by_id(sensors, &format!("/gpu-amd/{pos}/smalldata/2"))
+                        .map(|s| s.value as u64).filter(|&v| v > 0)
+                }).or_else(|| vram_bytes.map(|b: u64| b >> 20));
+
                 AmdGpuMetrics {
                     index: pos,
                     name,
-                    vram_mb:        vram_bytes.map(|b: u64| b >> 20),
+                    vram_used_mb,
+                    vram_total_mb,
                     utilization_3d: util_3d,
                     temperature,
                     fan_speed,
@@ -745,7 +972,37 @@ impl Monitor {
                 .map(|c| c.temperature())
         });
 
-        CpuMetrics { name, overall_usage, core_usages, package_temp }
+        let fan_rpm = lhm.and_then(|sensors| {
+            // Try exact confirmed ID first; fall back to any non-zero /lpc/*/fan/* sensor
+            lhm_bridge::find_by_id(sensors, "/lpc/nct6687dr/0/fan/0")
+                .map(|s| s.value as u32)
+                .filter(|&v| v > 0)
+                .or_else(|| {
+                    sensors.iter()
+                        .find(|s| {
+                            let id = s.identifier.to_lowercase();
+                            id.starts_with("/lpc/") && id.contains("/fan/") && s.value > 0.0
+                        })
+                        .map(|s| s.value as u32)
+                })
+        });
+
+        let ram = lhm.and_then(|sensors| {
+            let used = lhm_bridge::find_by_id(sensors, "/ram/data/0")?.value;
+            let free = lhm_bridge::find_by_id(sensors, "/ram/data/1")?.value;
+            if used > 0.0 {
+                Some(SystemMemoryMetrics { used_gb: used, total_gb: used + free })
+            } else {
+                None
+            }
+        });
+
+        #[cfg(windows)]
+        let npu_usage = self.wmi_con.as_ref().and_then(query_npu_utilization);
+        #[cfg(not(windows))]
+        let npu_usage: Option<f64> = None;
+
+        CpuMetrics { name, overall_usage, core_usages, package_temp, fan_rpm, ram, npu_usage }
     }
 
     // ── NVIDIA fan helpers ───────────────────────────────────────────
@@ -879,6 +1136,51 @@ fn query_video_controllers(wmi: &WMIConnection) -> Vec<(String, String, Option<u
             Some((name, compat, vram))
         })
         .collect()
+}
+
+/// Query Intel NPU (AI Boost) utilization via WMI GPUEngine performance counters.
+/// On first call, dumps all unique engine types found so we can identify the NPU adapter.
+/// Returns None when NPU is not present or not enumerated by Windows.
+#[cfg(windows)]
+fn query_npu_utilization(wmi: &WMIConnection) -> Option<f64> {
+    let rows: Vec<std::collections::HashMap<String, Variant>> = wmi
+        .raw_query(
+            "SELECT Name, UtilizationPercentage \
+             FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine",
+        )
+        .ok()?;
+
+    // One-time diagnostic: log unique engine types to identify NPU adapter
+    if !WMI_ENGINE_DUMPED.swap(true, Ordering::Relaxed) {
+        eprintln!("[HybridGauge] WMI GPUEngine entries ({}):", rows.len());
+        let mut seen = std::collections::HashSet::<String>::new();
+        for row in &rows {
+            if let Some(Variant::String(name)) = row.get("Name") {
+                // engtype is the last '_'-separated segment
+                let engtype = name.split('_').last().unwrap_or("?").to_lowercase();
+                if seen.insert(engtype.clone()) {
+                    let util = extract_u64(row.get("UtilizationPercentage").cloned()).unwrap_or(0);
+                    let short = &name[..name.len().min(70)];
+                    eprintln!("[HybridGauge]   [{engtype}] {util}% — {short}");
+                }
+            }
+        }
+    }
+
+    // Match entries where the adapter description contains NPU / AI Boost keywords
+    let (mut sum, mut count) = (0u64, 0usize);
+    for row in &rows {
+        let name = match row.get("Name") {
+            Some(Variant::String(s)) => s.to_lowercase(),
+            _ => continue,
+        };
+        if name.contains("npu") || name.contains("ai boost") || name.contains("neural") {
+            if let Some(v) = extract_u64(row.get("UtilizationPercentage").cloned()) {
+                sum += v; count += 1;
+            }
+        }
+    }
+    if count > 0 { Some(sum as f64 / count as f64) } else { None }
 }
 
 #[cfg(windows)]

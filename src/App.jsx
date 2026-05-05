@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Thermometer, Monitor, Wind, Database, Activity, Zap, Shield, Layers
+  Thermometer, Monitor, Wind, Database, Activity, Zap, Shield, Layers, Cpu
 } from "lucide-react";
 import "./App.css";
 
@@ -17,7 +17,7 @@ function Bar({ value, max = 100, color }) {
   );
 }
 
-function Metric({ icon: Icon, label, value, unit, bar, color }) {
+function Metric({ icon: Icon, label, value, unit, bar, barValue, color }) {
   return (
     <div className="metric">
       <div className="metric-header">
@@ -28,7 +28,7 @@ function Metric({ icon: Icon, label, value, unit, bar, color }) {
         </span>
       </div>
       {bar && value !== null && value !== undefined && (
-        <Bar value={value} max={bar} color={color} />
+        <Bar value={barValue !== undefined ? barValue : value} max={bar} color={color} />
       )}
     </div>
   );
@@ -135,6 +135,7 @@ function NvidiaCard({ gpu, fanOverride, onOverrideChange }) {
           value={`${gpu.vram_used_mb} / ${gpu.vram_total_mb}`}
           unit=" MB"
           bar={gpu.vram_total_mb}
+          barValue={gpu.vram_used_mb}
           color="#9c27b0"
         />
       )}
@@ -168,8 +169,16 @@ function AmdCard({ gpu, fanOverride, onOverrideChange }) {
       {gpu.fan_rpm != null && (
         <Metric icon={Wind}      label="ファン回転数"   value={gpu.fan_rpm}   unit=" RPM" color="#4fc3f7" />
       )}
-      {gpu.vram_mb && (
-        <Metric icon={Database}  label="VRAM"          value={gpu.vram_mb} unit=" MB" color="#9c27b0" />
+      {gpu.vram_total_mb && (
+        <Metric
+          icon={Database}
+          label="VRAM使用量"
+          value={`${gpu.vram_used_mb ?? "?"} / ${gpu.vram_total_mb}`}
+          unit=" MB"
+          bar={gpu.vram_total_mb}
+          barValue={gpu.vram_used_mb}
+          color="#9c27b0"
+        />
       )}
       {gpu.temperature == null && (
         <p className="note">温度取得不可: LibreHardwareMonitor を起動するか atiadlxx.dll を確認してください</p>
@@ -193,6 +202,22 @@ function CpuCard({ cpu }) {
     <Card title={`CPU — ${cpu.name}`} accent="#2196f3">
       <Metric icon={Zap}         label="全コア合計"     value={Math.round(cpu.overall_usage)} unit="%" bar={100} color="#2196f3" />
       <Metric icon={Thermometer} label="温度 (Package)" value={cpu.package_temp != null ? Math.round(cpu.package_temp) : null} unit="°C" bar={110} color="#ff9800" />
+      <Metric icon={Wind}        label="ファン回転数"   value={cpu.fan_rpm ?? null} unit=" RPM" color="#03a9f4" />
+      {cpu.ram && (
+        <Metric
+          icon={Database}
+          label="RAM使用量"
+          value={`${cpu.ram.used_gb.toFixed(1)} / ${cpu.ram.total_gb.toFixed(1)}`}
+          unit=" GB"
+          bar={cpu.ram.total_gb}
+          barValue={cpu.ram.used_gb}
+          color="#9c27b0"
+        />
+      )}
+      {cpu.npu_usage != null
+        ? <Metric icon={Cpu} label="NPU負荷" value={Math.round(cpu.npu_usage)} unit="%" bar={100} color="#e91e63" />
+        : <p className="note">NPU: 取得不可（Windows 11 24H2 + Intel Core Ultra が必要）</p>
+      }
       {cpu.package_temp == null && (
         <p className="note">CPU温度取得不可: LibreHardwareMonitor を起動してください</p>
       )}
@@ -220,6 +245,7 @@ export default function App() {
   const [fanOverrides, setFanOverrides]       = useState({});
   const [amdFanOverrides, setAmdFanOverrides] = useState({});
   const [presetActive, setPresetActive] = useState(false);
+  const [optimizationActive, setOptimizationActive] = useState(false);
 
   useEffect(() => {
     let unlisten;
@@ -255,6 +281,16 @@ export default function App() {
       console.error("set_fan_speed failed:", e);
     }
   }, []);
+
+  const handleOptimizationToggle = useCallback(async () => {
+    const next = !optimizationActive;
+    setOptimizationActive(next);
+    try {
+      await invoke("set_optimization_mode", { active: next });
+    } catch (e) {
+      console.error("set_optimization_mode failed:", e);
+    }
+  }, [optimizationActive]);
 
   // Rendering preset: set all controllable NVIDIA GPUs to 80%
   const handleRenderingPreset = useCallback(async () => {
@@ -303,6 +339,14 @@ export default function App() {
             レンダリング・プリセット
           </button>
         )}
+        <button
+          className={`preset-btn ${optimizationActive ? "active" : ""}`}
+          onClick={handleOptimizationToggle}
+          title="ワークロード最適化モードのオン/オフ"
+        >
+          <Cpu size={13} />
+          最適化モード
+        </button>
         <span className="tick">#{tick}</span>
       </header>
 

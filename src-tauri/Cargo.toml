@@ -23,3 +23,4 @@ wmi = "0.14"
 parking_lot = "0.12"
 libloading = "0.8"
 confy = "0.6"
+ureq = { version = "2", default-features = false }

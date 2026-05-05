@@ -31,6 +31,14 @@ fn set_amd_fan_speed(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn set_optimization_mode(active: bool) {
+    eprintln!(
+        "[HybridGauge] Optimization {}",
+        if active { "Active" } else { "Inactive" }
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let (fan_tx, fan_rx) = mpsc::channel::<FanCommand>();
@@ -60,7 +68,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_fan_speed, set_amd_fan_speed])
+        .invoke_handler(tauri::generate_handler![set_fan_speed, set_amd_fan_speed, set_optimization_mode])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

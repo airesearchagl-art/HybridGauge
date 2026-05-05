@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "clean-dev": "taskkill /F /IM hybrid-gauge.exe /T 2>nul & npm run tauri dev"
+    "clean-dev": "taskkill /F /IM hybrid-gauge.exe /T 2>nul & (for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :1420') do taskkill /F /PID %a /T 2>nul) & npm run tauri dev"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
