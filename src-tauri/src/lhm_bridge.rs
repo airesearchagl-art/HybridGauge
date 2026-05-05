@@ -23,13 +23,34 @@
 //!     f32       max            (4 bytes, offset 812)
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SensorSnapshot {
     pub name:          String,
     pub identifier:    String,
-    #[allow(dead_code)]
     pub sensor_type:   String,
     pub hardware_name: String,
     pub value:         f32,
+}
+
+/// Find the first sensor whose identifier exactly matches `id` (case-insensitive).
+pub fn find_by_id<'a>(sensors: &'a [SensorSnapshot], id: &str) -> Option<&'a SensorSnapshot> {
+    let id_lower = id.to_lowercase();
+    sensors.iter().find(|s| s.identifier.to_lowercase() == id_lower)
+}
+
+/// Collect sensors whose identifier contains every string in `must` and none in `exclude`.
+pub fn filter_by_id<'a>(
+    sensors: &'a [SensorSnapshot],
+    must:    &[&str],
+    exclude: &[&str],
+) -> Vec<&'a SensorSnapshot> {
+    sensors.iter()
+        .filter(|s| {
+            let id = s.identifier.to_lowercase();
+            must.iter().all(|kw| id.contains(kw))
+                && !exclude.iter().any(|kw| id.contains(kw))
+        })
+        .collect()
 }
 
 /// Try to read all sensors from a running LibreHardwareMonitor instance.

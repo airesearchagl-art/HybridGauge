@@ -290,7 +290,8 @@ pub struct AmdGpuMetrics {
     pub vram_mb:                Option<u64>,
     pub utilization_3d:         Option<f64>,
     pub temperature:            Option<f32>,
-    pub fan_speed:              Option<u32>,
+    pub fan_speed:              Option<u32>, // control % (ADL or LHM /control/)
+    pub fan_rpm:                Option<u32>, // actual RPM from LHM /fan/
     pub fan_control_available:  bool,
     pub safety_override_active: bool,
     pub fan_override:           Option<u32>,
@@ -615,43 +616,55 @@ impl Monitor {
         let util_3d = query_gpu_3d_utilization(wmi);
         let fan_control_available = self.adl_fan.is_some();
 
-        // AMD GPU keywords used for matching LHM hardware names
-        const AMD_KW: &[&str] = &[
-            "radeon", "amd", "rx ", "rx9", "rx7", "rx6", "vega", "navi", "rdna",
-        ];
-
         amd_adapters
             .into_iter()
             .enumerate()
             .map(|(pos, (name, _compat, vram_bytes))| {
+                // Identifier rules confirmed from LHM report:
+                //   temperature : /gpu-amd/<N>/temperature/<N>
+                //   fan RPM     : /gpu-amd/<N>/fan/<N>
+                //   fan control : /gpu-amd/<N>/control/<N>
+                // intel-integrated GPUs must be excluded entirely.
+
                 // ── Temperature: LHM → ADL → sysinfo/WMI ──────────────
                 let lhm_temp: Option<f32> = lhm.and_then(|sensors| {
-                    sensors.iter()
-                        .filter(|s| {
-                            let id = s.identifier.to_lowercase();
-                            let hw = s.hardware_name.to_lowercase();
-                            id.contains("/gpu") && id.contains("/temperature")
-                                && AMD_KW.iter().any(|kw| hw.contains(kw))
-                        })
-                        .nth(pos)            // pick the pos-th AMD GPU sensor
-                        .map(|s| s.value)
-                        .filter(|&v| v > 0.0 && v < 150.0)
+                    lhm_bridge::filter_by_id(
+                        sensors,
+                        &["/gpu-amd/", "/temperature"],
+                        &["intel"],
+                    )
+                    .into_iter()
+                    .nth(pos)
+                    .map(|s| s.value)
+                    .filter(|&v| v > 0.0 && v < 150.0)
                 });
 
-                // ── Fan speed from LHM (read-only display, not tied to ADL) ──
-                let lhm_fan: Option<u32> = lhm.and_then(|sensors| {
-                    sensors.iter()
-                        .filter(|s| {
-                            let id = s.identifier.to_lowercase();
-                            let hw = s.hardware_name.to_lowercase();
-                            id.contains("/gpu") && id.contains("/fan")
-                                && AMD_KW.iter().any(|kw| hw.contains(kw))
-                        })
-                        .nth(pos)
-                        .and_then(|s| {
-                            let v = s.value;
-                            if v >= 0.0 && v <= 100.0 { Some(v as u32) } else { None }
-                        })
+                // ── Fan RPM from LHM (/gpu-amd/N/fan/N) ───────────────
+                let lhm_fan_rpm: Option<u32> = lhm.and_then(|sensors| {
+                    lhm_bridge::filter_by_id(
+                        sensors,
+                        &["/gpu-amd/", "/fan"],
+                        &["intel"],
+                    )
+                    .into_iter()
+                    .nth(pos)
+                    .map(|s| s.value as u32)
+                    .filter(|&v| v > 0)
+                });
+
+                // ── Fan control % from LHM (/gpu-amd/N/control/N) ─────
+                let lhm_fan_pct: Option<u32> = lhm.and_then(|sensors| {
+                    lhm_bridge::filter_by_id(
+                        sensors,
+                        &["/gpu-amd/", "/control"],
+                        &["intel"],
+                    )
+                    .into_iter()
+                    .nth(pos)
+                    .and_then(|s| {
+                        let v = s.value;
+                        if v >= 0.0 && v <= 100.0 { Some(v as u32) } else { None }
+                    })
                 });
 
                 let adl_idx = self.adl_fan.as_ref().and_then(|adl| adl.adl_index(pos));
@@ -661,10 +674,10 @@ impl Monitor {
                     .or_else(|| query_amd_temp_from_components(&self.components))
                     .or_else(|| self.wmi_thermal.as_ref().and_then(query_amd_temp_from_thermal_wmi));
 
-                // Fan speed: ADL preferred for real-time accuracy; LHM as fallback
+                // fan_speed (%): ADL preferred; LHM /control/ as fallback
                 let fan_speed = adl_idx
                     .and_then(|idx| self.adl_fan.as_ref().unwrap().fan_speed_pct(idx))
-                    .or(lhm_fan);
+                    .or(lhm_fan_pct);
 
                 AmdGpuMetrics {
                     index: pos,
@@ -673,6 +686,7 @@ impl Monitor {
                     utilization_3d: util_3d,
                     temperature,
                     fan_speed,
+                    fan_rpm:         lhm_fan_rpm,
                     fan_control_available,
                     safety_override_active: self.amd_safety_active.contains(&pos),
                     fan_override:    self.amd_fan_overrides.get(&pos).copied(),
@@ -694,14 +708,23 @@ impl Monitor {
             .map(|c| c.brand().to_string())
             .unwrap_or_else(|| "CPU".to_string());
 
-        // Priority 1: LHM — reliable for Intel Core Ultra (Arrow Lake/Meteor Lake)
-        //             and AMD Zen 4/5, where sysinfo often fails on Windows.
+        // Priority 1: LHM — reliable for Intel Core Ultra 285K (Arrow Lake) and Zen 4/5.
         let lhm_temp = lhm.and_then(|sensors| {
+            // 1a. Exact identifier confirmed for Core Ultra 9 285K
+            if let Some(v) = lhm_bridge::find_by_id(sensors, "/intelcpu/0/temperature/26")
+                .map(|s| s.value)
+                .filter(|&v| v > 0.0 && v < 150.0)
+            {
+                return Some(v);
+            }
+
+            // 1b. Any Intel/AMD CPU package or max-core temperature
             sensors.iter()
                 .filter(|s| {
                     let id = s.identifier.to_lowercase();
                     let nm = s.name.to_lowercase();
-                    id.contains("/cpu") && id.contains("/temperature")
+                    (id.contains("/intelcpu") || id.contains("/amdcpu"))
+                        && id.contains("/temperature")
                         && (nm.contains("package")
                             || nm == "core max"
                             || nm.contains("cpu composite")

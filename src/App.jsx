@@ -165,6 +165,9 @@ function AmdCard({ gpu, fanOverride, onOverrideChange }) {
         color={gpu.temperature >= 85 ? "#f44336" : "#ff9800"}
       />
       <Metric icon={Wind}        label="ファン速度"     value={gpu.fan_speed} unit="%" bar={100} color="#03a9f4" />
+      {gpu.fan_rpm != null && (
+        <Metric icon={Wind}      label="ファン回転数"   value={gpu.fan_rpm}   unit=" RPM" color="#4fc3f7" />
+      )}
       {gpu.vram_mb && (
         <Metric icon={Database}  label="VRAM"          value={gpu.vram_mb} unit=" MB" color="#9c27b0" />
       )}
